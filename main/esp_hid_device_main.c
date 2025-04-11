@@ -50,8 +50,8 @@
 #define PASTE_BUTTON_PIN GPIO_NUM_27
 
 // 鼠标移动参数
-#define MOUSE_SPEED_SCALE 300000
-#define DEAD_ZONE 10
+#define MOUSE_SPEED_SCALE 600.0
+#define DEAD_SCALE 0.48
 #define HID_QUEUE_SIZE 10
 
 // HID命令类型
@@ -744,10 +744,11 @@ static void ble_hidd_event_callback(void *handler_args, esp_event_base_t base, i
 
 #if CONFIG_BT_HID_DEVICE_ENABLED
 static local_param_t s_bt_hid_param = {0};
-const unsigned char mouseReportMap[] = {
+const unsigned char combinedReportMap[] = {
     0x05, 0x01, // USAGE_PAGE (Generic Desktop)
     0x09, 0x02, // USAGE (Mouse)
     0xa1, 0x01, // COLLECTION (Application)
+    0x85, 0x02, // REPORT_ID (2)
 
     0x09, 0x01, //   USAGE (Pointer)
     0xa1, 0x00, //   COLLECTION (Physical)
@@ -773,21 +774,52 @@ const unsigned char mouseReportMap[] = {
     0x75, 0x08, //     REPORT_SIZE (8)
     0x95, 0x03, //     REPORT_COUNT (3)
     0x81, 0x06, //     INPUT (Data,Var,Rel)
+    0xc0,       //     END_COLLECTION
+    0xc0,       //     END_COLLECTION
 
-    0xc0, //   END_COLLECTION
-    0xc0  // END_COLLECTION
+    // 65 bytes */
+    0x05, 0x01, // Usage Page (Generic Desktop)
+    0x09, 0x06, // Usage (Keyboard)
+    0xA1, 0x01, // Collection (Application)
+    0x85, 0x01, //   Report ID (1)
+
+    // 修改为7字节输入报告
+    0x05, 0x07, //   Usage Page (Key Codes)
+    0x19, 0xE0, //   Usage Minimum (224)
+    0x29, 0xE7, //   Usage Maximum (231)
+    0x15, 0x00, //   Logical Minimum (0)
+    0x25, 0x01, //   Logical Maximum (1)
+    0x75, 0x01, //   Report Size (1)
+    0x95, 0x08, //   Report Count (8)
+    0x81, 0x02, //   Input (Data,Var,Abs) // 1字节修饰键
+
+    0x95, 0x01, //   Report Count (1)
+    0x75, 0x08, //   Report Size (8)
+    0x81, 0x01, //   Input (Const) // 1字节保留
+
+    0x95, 0x06, //   Report Count (6) // 改为6个键码
+    0x75, 0x08, //   Report Size (8)
+    0x15, 0x00, //   Logical Minimum (0)
+    0x25, 0x65, //   Logical Maximum (101)
+    0x05, 0x07, //   Usage Page (Key Codes)
+    0x19, 0x00, //   Usage Minimum (0)
+    0x29, 0x65, //   Usage Maximum (101)
+    0x81, 0x00, //   Input (Data,Array) // 6字节键码
+
+    0x05, 0x08, //   Usage Page (LEDs)
+    0xC0        // End Collection
 };
 
 static esp_hid_raw_report_map_t bt_report_maps[] = {
-    {.data = mouseReportMap,
-     .len = sizeof(mouseReportMap)},
+    {.data = combinedReportMap,
+     .len = sizeof(combinedReportMap)},
 };
 
 static esp_hid_device_config_t bt_hid_config = {
     .vendor_id = 0x16C0,
     .product_id = 0x05DF,
     .version = 0x0100,
-    .device_name = "ESP32 PS2 Mouse",
+    .device_name = "AAA razer V2 pro hyper speed",
     .manufacturer_name = "Espressif",
     .serial_number = "1234567890",
     .report_maps = bt_report_maps,
@@ -862,16 +894,22 @@ void mouse_task(void *pvParameters)
         // 读取摇杆位置
         int raw_x = adc_read_raw(JOYSTICK_X_PIN) - joystick_zero_x;
         int raw_y = adc_read_raw(JOYSTICK_Y_PIN) - joystick_zero_y;
+        float scale_x = (float)raw_x / MOUSE_SPEED_SCALE;
+        float scale_y = (float)raw_y / MOUSE_SPEED_SCALE;
+        int8_t sgn_x = scale_x > 0 ? 1 : -1;
+        int8_t sgn_y = scale_y > 0 ? 1 : -1;
+        scale_x += sgn_x * DEAD_SCALE;
+        scale_y += sgn_y * DEAD_SCALE;
 
-        // 应用死区
+        /* // 应用死区
         if (abs(raw_x) < DEAD_ZONE)
             raw_x = 0;
         if (abs(raw_y) < DEAD_ZONE)
-            raw_y = 0;
+            raw_y = 0; */
 
         // 计算鼠标移动量
-        int8_t dx = (int8_t)(raw_x * abs(raw_x) / MOUSE_SPEED_SCALE);
-        int8_t dy = (int8_t)(raw_y * abs(raw_y) / MOUSE_SPEED_SCALE);
+        int8_t dx = (int8_t)(sgn_x * scale_x * scale_x);
+        int8_t dy = (int8_t)(sgn_y * scale_y * scale_y);
         // printf("dx:%d\tdy:%d\n", dx, dy);
 
         // 读取左键状态
@@ -892,6 +930,67 @@ void mouse_task(void *pvParameters)
         }
 
         vTaskDelay(10 / portTICK_PERIOD_MS); // 100Hz更新率
+    }
+}
+
+void keyboard_task(void *pvParameters)
+{
+    ESP_LOGI(TAG, "Keyboard task started");
+
+    bool copy_pressed = false;
+    bool paste_pressed = false;
+
+    while (1)
+    {
+        // 处理复制按钮 (Ctrl+C)
+        if (!gpio_get_level(COPY_BUTTON_PIN))
+        {
+            if (!copy_pressed)
+            {
+                hid_command_t cmd = {
+                    .type = HID_CMD_KEYBOARD,
+                    .keyboard = {
+                        .modifier = 0x01, // Left Ctrl
+                        .key1 = 0x06,     // C key
+                        .key2 = 0         // No second key
+                    }};
+
+                if (xQueueSend(hid_queue, &cmd, pdMS_TO_TICKS(10)) != pdTRUE)
+                {
+                    ESP_LOGE(TAG, "Keyboard queue full");
+                }
+                ESP_LOGE(TAG, "Copy pressed");
+                copy_pressed = true;
+            }
+        }
+        // 处理粘贴按钮 (Ctrl+V)
+        else if (!gpio_get_level(PASTE_BUTTON_PIN))
+        {
+            if (!paste_pressed)
+            {
+                hid_command_t cmd = {
+                    .type = HID_CMD_KEYBOARD,
+                    .keyboard = {
+                        .modifier = 0x01, // Left Ctrl
+                        .key1 = 0x19,     // V key
+                        .key2 = 0         // No second key
+                    }};
+
+                if (xQueueSend(hid_queue, &cmd, pdMS_TO_TICKS(10)) != pdTRUE)
+                {
+                    ESP_LOGE(TAG, "Keyboard queue full");
+                }
+                ESP_LOGE(TAG, "Paste pressed");
+                paste_pressed = true;
+            }
+        }
+        else
+        {
+            copy_pressed = false;
+            paste_pressed = false;
+        }
+
+        vTaskDelay(50 / portTICK_PERIOD_MS); // 20Hz检查频率
     }
 }
 
@@ -916,7 +1015,7 @@ void hid_sender_task(void *pvParameters)
                         cmd.mouse.dx,
                         cmd.mouse.dy,
                         0};
-                    esp_hidd_dev_input_set(s_bt_hid_param.hid_dev, 0, 0, buffer, 4);
+                    esp_hidd_dev_input_set(s_bt_hid_param.hid_dev, 0, 2, buffer, 4);
                 }
                 break;
 
@@ -930,12 +1029,12 @@ void hid_sender_task(void *pvParameters)
                         cmd.keyboard.key2,
                         0, 0, 0, 0 // Other keys
                     };
-                    esp_hidd_dev_input_set(s_bt_hid_param.hid_dev, 0, 2, buffer, 8);
+                    esp_hidd_dev_input_set(s_bt_hid_param.hid_dev, 0, 1, buffer, 8);
 
                     // 发送按键释放
                     vTaskDelay(50 / portTICK_PERIOD_MS);
                     memset(buffer, 0, 8);
-                    esp_hidd_dev_input_set(s_bt_hid_param.hid_dev, 0, 2, buffer, 8);
+                    esp_hidd_dev_input_set(s_bt_hid_param.hid_dev, 0, 1, buffer, 8);
                 }
                 break;
 
@@ -949,7 +1048,8 @@ void hid_sender_task(void *pvParameters)
 
 void bt_hid_task_start_up(void)
 {
-    xTaskCreate(mouse_task, "bt_hid_demo_task", 4 * 1024, NULL, configMAX_PRIORITIES - 3, &s_bt_hid_param.task_hdl);
+    xTaskCreate(mouse_task, "mouse_task", 3 * 1024, NULL, 2, &s_bt_hid_param.task_hdl);
+    xTaskCreate(keyboard_task, "keyboard_task", 3 * 1024, NULL, 2, NULL);
     xTaskCreate(hid_sender_task, "hid_sender_task", 4 * 1024, NULL, 4, NULL);
     return;
 }

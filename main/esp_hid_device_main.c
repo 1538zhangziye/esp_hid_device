@@ -43,8 +43,51 @@
 #include "esp_adc/adc_oneshot.h"
 #include "driver/gpio.h"
 
+#define JOYSTICK_X_PIN ADC_CHANNEL_6 // GPIO34
+#define JOYSTICK_Y_PIN ADC_CHANNEL_7 // GPIO35
+#define LEFT_BUTTON_PIN GPIO_NUM_25
+#define COPY_BUTTON_PIN GPIO_NUM_26
+#define PASTE_BUTTON_PIN GPIO_NUM_27
+
+// 鼠标移动参数
+#define MOUSE_SPEED_SCALE 300000
+#define DEAD_ZONE 10
+#define HID_QUEUE_SIZE 10
+
+// HID命令类型
+typedef enum
+{
+    HID_CMD_MOUSE,
+    HID_CMD_KEYBOARD
+} hid_cmd_type_t;
+
+// HID命令结构体
+typedef struct
+{
+    hid_cmd_type_t type;
+    union
+    {
+        struct
+        {
+            uint8_t buttons;
+            int8_t dx;
+            int8_t dy;
+        } mouse;
+        struct
+        {
+            uint8_t modifier;
+            uint8_t key1;
+            uint8_t key2;
+        } keyboard;
+    };
+} hid_command_t;
+
+// 全局变量
 static int joystick_zero_x = 2048;
 static int joystick_zero_y = 2048;
+// static esp_hidd_dev_t *hid_dev = NULL;
+static QueueHandle_t hid_queue = NULL;
+static adc_oneshot_unit_handle_t adc1_handle = NULL;
 
 static const char *TAG = "HID_DEV_DEMO";
 
@@ -744,74 +787,170 @@ static esp_hid_device_config_t bt_hid_config = {
     .vendor_id = 0x16C0,
     .product_id = 0x05DF,
     .version = 0x0100,
-    .device_name = "ESP BT HID1",
+    .device_name = "ESP32 PS2 Mouse",
     .manufacturer_name = "Espressif",
     .serial_number = "1234567890",
     .report_maps = bt_report_maps,
     .report_maps_len = 1};
 
-// send the buttons, change in x, and change in y
-void send_mouse(uint8_t buttons, char dx, char dy, char wheel)
+void hardware_init()
 {
-    static uint8_t buffer[4] = {0};
-    buffer[0] = buttons;
-    buffer[1] = dx;
-    buffer[2] = dy;
-    buffer[3] = wheel;
-    esp_hidd_dev_input_set(s_bt_hid_param.hid_dev, 0, 0, buffer, 4);
+    // 1. ADC单次采样配置
+    adc_oneshot_unit_init_cfg_t init_config = {
+        .unit_id = ADC_UNIT_1,
+        .ulp_mode = ADC_ULP_MODE_DISABLE,
+    };
+    ESP_ERROR_CHECK(adc_oneshot_new_unit(&init_config, &adc1_handle));
+
+    // 2. 通道配置
+    adc_oneshot_chan_cfg_t channel_config = {
+        .atten = ADC_ATTEN_DB_12,
+        .bitwidth = ADC_BITWIDTH_12,
+    };
+    ESP_ERROR_CHECK(adc_oneshot_config_channel(adc1_handle, JOYSTICK_X_PIN, &channel_config));
+    ESP_ERROR_CHECK(adc_oneshot_config_channel(adc1_handle, JOYSTICK_Y_PIN, &channel_config));
+
+    ESP_LOGI(TAG, "ADC oneshot mode initialized");
+
+    // GPIO初始化
+    gpio_config_t io_conf = {
+        .pin_bit_mask = (1ULL << LEFT_BUTTON_PIN) |
+                        (1ULL << COPY_BUTTON_PIN) |
+                        (1ULL << PASTE_BUTTON_PIN),
+        .mode = GPIO_MODE_INPUT,
+        .pull_up_en = GPIO_PULLUP_ENABLE,
+        .intr_type = GPIO_INTR_DISABLE};
+    gpio_config(&io_conf);
+
+    // 创建HID命令队列
+    hid_queue = xQueueCreate(HID_QUEUE_SIZE, sizeof(hid_command_t));
 }
 
-void bt_hid_demo_task(void *pvParameters)
+int adc_read_raw(adc_channel_t channel)
 {
-    static const char *help_string = "########################################################################\n"
-                                     "BT hid mouse demo usage:\n"
-                                     "You can input these value to simulate mouse: 'q', 'w', 'e', 'a', 's', 'd', 'h'\n"
-                                     "q -- click the left key\n"
-                                     "w -- move up\n"
-                                     "e -- click the right key\n"
-                                     "a -- move left\n"
-                                     "s -- move down\n"
-                                     "d -- move right\n"
-                                     "h -- show the help\n"
-                                     "########################################################################\n";
-    printf("%s\n", help_string);
-    char c;
+    int raw_value = 0;
+    ESP_ERROR_CHECK(adc_oneshot_read(adc1_handle, channel, &raw_value));
+    return raw_value;
+}
+
+void calibrate_joystick()
+{
+    int sum_x = 0, sum_y = 0;
+    const int samples = 100;
+
+    ESP_LOGI(TAG, "Calibrating joystick... Keep it centered");
+
+    for (int i = 0; i < samples; i++)
+    {
+        sum_x += adc_read_raw(JOYSTICK_X_PIN);
+        sum_y += adc_read_raw(JOYSTICK_Y_PIN);
+        vTaskDelay(10 / portTICK_PERIOD_MS);
+    }
+
+    joystick_zero_x = sum_x / samples;
+    joystick_zero_y = sum_y / samples;
+
+    ESP_LOGI(TAG, "Calibration complete: X=%d, Y=%d", joystick_zero_x, joystick_zero_y);
+}
+
+void mouse_task(void *pvParameters)
+{
+    ESP_LOGI(TAG, "Mouse task started");
+
     while (1)
     {
-        c = fgetc(stdin);
-        switch (c)
+        // 读取摇杆位置
+        int raw_x = adc_read_raw(JOYSTICK_X_PIN) - joystick_zero_x;
+        int raw_y = adc_read_raw(JOYSTICK_Y_PIN) - joystick_zero_y;
+
+        // 应用死区
+        if (abs(raw_x) < DEAD_ZONE)
+            raw_x = 0;
+        if (abs(raw_y) < DEAD_ZONE)
+            raw_y = 0;
+
+        // 计算鼠标移动量
+        int8_t dx = (int8_t)(raw_x * abs(raw_x) / MOUSE_SPEED_SCALE);
+        int8_t dy = (int8_t)(raw_y * abs(raw_y) / MOUSE_SPEED_SCALE);
+        // printf("dx:%d\tdy:%d\n", dx, dy);
+
+        // 读取左键状态
+        uint8_t buttons = !gpio_get_level(LEFT_BUTTON_PIN) ? 0x01 : 0x00;
+
+        // 创建鼠标命令
+        hid_command_t cmd = {
+            .type = HID_CMD_MOUSE,
+            .mouse = {
+                .buttons = buttons,
+                .dx = dx,
+                .dy = dy}};
+
+        // 发送到队列
+        if (xQueueSend(hid_queue, &cmd, pdMS_TO_TICKS(10)) != pdTRUE)
         {
-        case 'q':
-            send_mouse(1, 0, 0, 0);
-            break;
-        case 'w':
-            send_mouse(0, 0, -10, 0);
-            break;
-        case 'e':
-            send_mouse(2, 0, 0, 0);
-            break;
-        case 'a':
-            send_mouse(0, -10, 0, 0);
-            break;
-        case 's':
-            send_mouse(0, 0, 10, 0);
-            break;
-        case 'd':
-            send_mouse(0, 10, 0, 0);
-            break;
-        case 'h':
-            printf("%s\n", help_string);
-            break;
-        default:
-            break;
+            ESP_LOGE(TAG, "Mouse queue full");
         }
-        vTaskDelay(10 / portTICK_PERIOD_MS);
+
+        vTaskDelay(10 / portTICK_PERIOD_MS); // 100Hz更新率
+    }
+}
+
+void hid_sender_task(void *pvParameters)
+{
+    ESP_LOGI(TAG, "HID sender task started");
+
+    hid_command_t cmd;
+
+    while (1)
+    {
+        // 从队列接收命令
+        if (xQueueReceive(hid_queue, &cmd, portMAX_DELAY) == pdTRUE)
+        {
+            switch (cmd.type)
+            {
+            case HID_CMD_MOUSE:
+                // 发送鼠标报告
+                {
+                    uint8_t buffer[4] = {
+                        cmd.mouse.buttons,
+                        cmd.mouse.dx,
+                        cmd.mouse.dy,
+                        0};
+                    esp_hidd_dev_input_set(s_bt_hid_param.hid_dev, 0, 0, buffer, 4);
+                }
+                break;
+
+            case HID_CMD_KEYBOARD:
+                // 发送键盘报告
+                {
+                    uint8_t buffer[8] = {
+                        cmd.keyboard.modifier,
+                        0, // Reserved
+                        cmd.keyboard.key1,
+                        cmd.keyboard.key2,
+                        0, 0, 0, 0 // Other keys
+                    };
+                    esp_hidd_dev_input_set(s_bt_hid_param.hid_dev, 0, 2, buffer, 8);
+
+                    // 发送按键释放
+                    vTaskDelay(50 / portTICK_PERIOD_MS);
+                    memset(buffer, 0, 8);
+                    esp_hidd_dev_input_set(s_bt_hid_param.hid_dev, 0, 2, buffer, 8);
+                }
+                break;
+
+            default:
+                ESP_LOGE(TAG, "Unknown HID command type");
+                break;
+            }
+        }
     }
 }
 
 void bt_hid_task_start_up(void)
 {
-    xTaskCreate(bt_hid_demo_task, "bt_hid_demo_task", 2 * 1024, NULL, configMAX_PRIORITIES - 3, &s_bt_hid_param.task_hdl);
+    xTaskCreate(mouse_task, "bt_hid_demo_task", 4 * 1024, NULL, configMAX_PRIORITIES - 3, &s_bt_hid_param.task_hdl);
+    xTaskCreate(hid_sender_task, "hid_sender_task", 4 * 1024, NULL, 4, NULL);
     return;
 }
 
@@ -1009,6 +1148,10 @@ void app_main(void)
     cod.minor = ESP_BT_COD_MINOR_PERIPHERAL_POINTING;
     esp_bt_gap_set_cod(cod, ESP_BT_SET_COD_MAJOR_MINOR);
     vTaskDelay(1000 / portTICK_PERIOD_MS);
+
+    hardware_init();
+    calibrate_joystick();
+
     ESP_LOGI(TAG, "setting bt device");
     ESP_ERROR_CHECK(
         esp_hidd_dev_init(&bt_hid_config, ESP_HID_TRANSPORT_BT, bt_hidd_event_callback, &s_bt_hid_param.hid_dev));
